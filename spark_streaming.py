@@ -1,6 +1,7 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
-    from_json, col, to_timestamp, expr, count, sum as spark_sum, when
+    from_json, col, to_timestamp, expr, count, sum as spark_sum,
+    when, current_timestamp, avg
 )
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType
 import os
@@ -21,7 +22,7 @@ schema = StructType([
     StructField("user_name", StringType()),
     StructField("game_name", StringType()),
     StructField("viewer_count", IntegerType()),
-    StructField("started_at", StringType())  # Keep as StringType initially
+    StructField("started_at", StringType())  # Kept as StringType, converted later
 ])
 
 # Function to read from Kafka
@@ -42,10 +43,8 @@ def get_kafka_stream(topic):
         print("⚠️ Kafka stream could not be initialized:", e)
         return None
 
-# Prompt the user for the Kafka topic to subscribe to
+# Kafka topic to consume
 topic_input = "twitch_streams_high"
-
-# Get the stream
 stream_df = get_kafka_stream(topic_input)
 
 if stream_df is None:
@@ -56,45 +55,75 @@ if stream_df is None:
 # ✨ TRANSFORMATION
 # ────────────────────────────────
 
-# Convert 'started_at' to TimestampType
+# Convert started_at to timestamp
 stream_df = stream_df.withColumn("started_at", to_timestamp(col("started_at")))
 
-# Filter streams that have more than 1000 viewers
+# Add record time
+stream_df = stream_df.withColumn("record_time", current_timestamp())
+
+# Filter out low-viewer streams
 filtered_streams = stream_df.filter(col("viewer_count") > 1000)
 
-# Add a new column 'is_popular' to label streams with more than 5000 viewers as "popular"
+# Add popularity flag
 filtered_streams = filtered_streams.withColumn(
     "is_popular", when(col("viewer_count") > 5000, True).otherwise(False)
 )
 
+# Add popularity bucket
+filtered_streams = filtered_streams.withColumn(
+    "viewer_bucket",
+    when(col("viewer_count") > 25000, "High")
+    .when(col("viewer_count") > 15000, "Medium")
+    .otherwise("Low")
+)
 
 # ────────────────────────────────
-# ✨ AGGREGATION
+# ✨ FOREACH BATCH
 # ────────────────────────────────
-# Function to process each batch of 20 records
+
 def process_batch(df, epoch_id):
-    # Aggregation per batch
+    start = time.time()
+
+    print(f"\n📦 Processing batch {epoch_id}")
+
+    # Total viewers per game
     viewers_per_game = df.groupBy("game_name").agg(
         spark_sum("viewer_count").alias("total_viewers"),
-        count("*").alias("num_streams")
-    ).orderBy(spark_sum("viewer_count").desc())
+        count("*").alias("num_streams"),
+        avg("viewer_count").alias("avg_viewers")
+    ).orderBy(col("total_viewers").desc())
 
-    # Display the aggregated data to the console
-    viewers_per_game.show()
+    print("🎮 Top games by viewers:")
+    viewers_per_game.show(5)
 
+    # Popularity distribution/popularity bucket
+    popularity_dist = df.groupBy("viewer_bucket").agg(
+        count("*").alias("count")
+    ).orderBy("viewer_bucket")
+
+    print("📊 Stream count by popularity:")
+    popularity_dist.show()
+
+    # Top streamers
+    top_streamers = df.groupBy("user_name").agg(
+        spark_sum("viewer_count").alias("total_viewers"),
+        count("*").alias("num_sessions")
+    ).orderBy(col("total_viewers").desc())
+
+    print("👤 Top streamers:")
+    top_streamers.show(5)
+    duration = time.time() - start
+    print(f"[PERF] Stream processing batch {epoch_id} took {duration:.2f} seconds")
+
+
+    
 # ────────────────────────────────
-# READ 20 RECORDS AND SLEEP FOR 20 SECONDS
+# ⏱️ START STREAMING
 # ────────────────────────────────
 
-# Use `foreachBatch` to control how we process batches of data (in chunks of 20)
-stream_df.writeStream \
+filtered_streams.writeStream \
     .foreachBatch(process_batch) \
     .trigger(processingTime="20 seconds") \
     .start()
 
-# Wait for the streams to process and ensure the stream is running continuously
 spark.streams.awaitAnyTermination()
-
-# Simulating a wait after reading the 20 records and processing them
-# This sleep will allow the Spark job to process 20 records, then wait for the next batch
-time.sleep(20)
